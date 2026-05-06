@@ -1,11 +1,10 @@
 {
   "name": "server-panel-bot",
   "version": "1.0.0",
-  "description": "A universal Discord server panel bot",
+  "description": "Universal Discord server panel bot",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js",
-    "deploy": "node deploy-commands.js"
+    "start": "node index.js"
   },
   "dependencies": {
     "discord.js": "^14.16.3",
