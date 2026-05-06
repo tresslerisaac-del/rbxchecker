@@ -21,7 +21,8 @@ const {
   PermissionFlagsBits,
   ChannelType,
   PermissionsBitField,
-  AttachmentBuilder
+  AttachmentBuilder,
+  AuditLogEvent
 } = require("discord.js");
 
 const { DISCORD_TOKEN, CLIENT_ID } = process.env;
@@ -29,6 +30,8 @@ const { DISCORD_TOKEN, CLIENT_ID } = process.env;
 if (!DISCORD_TOKEN || !CLIENT_ID) {
   throw new Error("Missing DISCORD_TOKEN or CLIENT_ID in Railway Variables.");
 }
+
+const VERSION = "4.0.0";
 
 const DATA_DIR =
   process.env.DATA_DIR ||
@@ -52,7 +55,10 @@ CREATE TABLE IF NOT EXISTS settings (
   autosave INTEGER DEFAULT 0,
   autosave_hours INTEGER DEFAULT 24,
   last_autosave INTEGER DEFAULT 0,
-  max_saves INTEGER DEFAULT 10
+  max_saves INTEGER DEFAULT 10,
+  antinuke_enabled INTEGER DEFAULT 0,
+  antinuke_threshold INTEGER DEFAULT 5,
+  antinuke_window INTEGER DEFAULT 20
 );
 
 CREATE TABLE IF NOT EXISTS panel_servers (
@@ -76,6 +82,15 @@ CREATE TABLE IF NOT EXISTS backups (
   created_at TEXT,
   data TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS security_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  guild_id TEXT NOT NULL,
+  event_type TEXT NOT NULL,
+  user_id TEXT,
+  detail TEXT,
+  created_at TEXT NOT NULL
+);
 `);
 
 function addColumnIfMissing(table, column, definition) {
@@ -90,11 +105,19 @@ function addColumnIfMissing(table, column, definition) {
 }
 
 for (const [column, definition] of [
+  ["theme", "theme INTEGER DEFAULT 5793266"],
+  ["panel_channel", "panel_channel TEXT"],
   ["log_channel", "log_channel TEXT"],
+  ["autopost", "autopost INTEGER DEFAULT 0"],
+  ["autopost_hours", "autopost_hours INTEGER DEFAULT 24"],
+  ["last_autopost", "last_autopost INTEGER DEFAULT 0"],
   ["autosave", "autosave INTEGER DEFAULT 0"],
   ["autosave_hours", "autosave_hours INTEGER DEFAULT 24"],
   ["last_autosave", "last_autosave INTEGER DEFAULT 0"],
-  ["max_saves", "max_saves INTEGER DEFAULT 10"]
+  ["max_saves", "max_saves INTEGER DEFAULT 10"],
+  ["antinuke_enabled", "antinuke_enabled INTEGER DEFAULT 0"],
+  ["antinuke_threshold", "antinuke_threshold INTEGER DEFAULT 5"],
+  ["antinuke_window", "antinuke_window INTEGER DEFAULT 20"]
 ]) {
   addColumnIfMissing("settings", column, definition);
 }
@@ -116,6 +139,11 @@ const sql = {
     WHERE guild_id = ?
   `),
   setMaxSaves: db.prepare("UPDATE settings SET max_saves = ? WHERE guild_id = ?"),
+  setAntiNuke: db.prepare(`
+    UPDATE settings
+    SET antinuke_enabled = ?, antinuke_threshold = ?, antinuke_window = ?
+    WHERE guild_id = ?
+  `),
   setLastAutopost: db.prepare("UPDATE settings SET last_autopost = ? WHERE guild_id = ?"),
   setLastAutosave: db.prepare("UPDATE settings SET last_autosave = ? WHERE guild_id = ?"),
   listAutoposts: db.prepare(`
@@ -172,12 +200,21 @@ const sql = {
     DELETE FROM panel_servers
     WHERE host_id = ? AND server_id = ?
   `),
+  clearPanelServers: db.prepare(`
+    DELETE FROM panel_servers
+    WHERE host_id = ?
+  `),
   editPanelServer: db.prepare(`
     UPDATE panel_servers
     SET
       name = COALESCE(?, name),
       description = COALESCE(?, description),
       category = COALESCE(?, category)
+    WHERE host_id = ? AND server_id = ?
+  `),
+  movePanelServer: db.prepare(`
+    UPDATE panel_servers
+    SET category = ?
     WHERE host_id = ? AND server_id = ?
   `),
 
@@ -204,6 +241,28 @@ const sql = {
     DELETE FROM backups
     WHERE guild_id = ? AND id = ?
   `),
+  renameBackup: db.prepare(`
+    UPDATE backups
+    SET name = ?
+    WHERE guild_id = ? AND id = ?
+  `),
+
+  addSecurityLog: db.prepare(`
+    INSERT INTO security_logs (
+      guild_id,
+      event_type,
+      user_id,
+      detail,
+      created_at
+    )
+    VALUES (?, ?, ?, ?, ?)
+  `),
+  listSecurityLogs: db.prepare(`
+    SELECT * FROM security_logs
+    WHERE guild_id = ?
+    ORDER BY id DESC
+    LIMIT ?
+  `),
 
   countServers: db.prepare(`
     SELECT COUNT(*) AS count FROM panel_servers
@@ -212,6 +271,12 @@ const sql = {
   countBackups: db.prepare(`
     SELECT COUNT(*) AS count FROM backups
     WHERE guild_id = ?
+  `),
+  totalPanelServers: db.prepare(`
+    SELECT COUNT(*) AS count FROM panel_servers
+  `),
+  totalBackups: db.prepare(`
+    SELECT COUNT(*) AS count FROM backups
   `)
 };
 
@@ -268,6 +333,25 @@ function chunkArray(array, size) {
     { length: Math.ceil(array.length / size) },
     (_, index) => array.slice(index * size, index * size + size)
   );
+}
+
+function formatDuration(seconds) {
+  const days = Math.floor(seconds / 86400);
+  const hours = Math.floor((seconds % 86400) / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+
+  const parts = [];
+
+  if (days) parts.push(`${days}d`);
+  if (hours) parts.push(`${hours}h`);
+  if (minutes) parts.push(`${minutes}m`);
+
+  return parts.join(" ") || `${Math.floor(seconds)}s`;
+}
+
+function channelTypeName(type) {
+  const found = Object.entries(ChannelType).find(([, value]) => value === type);
+  return found ? found[0] : `Unknown (${type})`;
 }
 
 function backupCounts(snapshot) {
@@ -336,6 +420,18 @@ function findBackup(guildId, input = "") {
   );
 }
 
+function findSavedServer(guildId, input) {
+  const query = String(input || "").toLowerCase();
+  const servers = sql.listPanelServers.all(guildId);
+
+  return (
+    servers.find((server) => server.server_id === query) ||
+    servers.find((server) => server.name.toLowerCase() === query) ||
+    servers.find((server) => server.name.toLowerCase().includes(query)) ||
+    null
+  );
+}
+
 function enforceBackupLimit(guildId) {
   const settings = getSettings(guildId);
   const maxSaves = settings.max_saves || 10;
@@ -353,6 +449,17 @@ const client = new Client({
   intents: [GatewayIntentBits.Guilds]
 });
 
+const securityBuckets = new Map();
+const securityIgnoreUntil = new Map();
+
+function ignoreSecurityEvents(guildId, ms = 180000) {
+  securityIgnoreUntil.set(guildId, Date.now() + ms);
+}
+
+function isIgnoringSecurity(guildId) {
+  return (securityIgnoreUntil.get(guildId) || 0) > Date.now();
+}
+
 const adminCommand = (command) =>
   command
     .setDMPermission(false)
@@ -362,6 +469,24 @@ const guildCommand = (command) =>
   command.setDMPermission(false);
 
 const commands = [
+  guildCommand(
+    new SlashCommandBuilder()
+      .setName("help")
+      .setDescription("Show the command list.")
+  ),
+
+  guildCommand(
+    new SlashCommandBuilder()
+      .setName("about")
+      .setDescription("Show bot info, uptime, and stats.")
+  ),
+
+  guildCommand(
+    new SlashCommandBuilder()
+      .setName("ping")
+      .setDescription("Show bot latency.")
+  ),
+
   guildCommand(
     new SlashCommandBuilder()
       .setName("send")
@@ -414,6 +539,54 @@ const commands = [
     new SlashCommandBuilder()
       .setName("removeserver")
       .setDescription("Remove a saved server with a dropdown.")
+  ),
+
+  adminCommand(
+    new SlashCommandBuilder()
+      .setName("clearservers")
+      .setDescription("Clear every saved server from this server's /send panel.")
+  ),
+
+  adminCommand(
+    new SlashCommandBuilder()
+      .setName("refreshserver")
+      .setDescription("Refresh a saved server's name, icon, and description from its invite.")
+      .addStringOption((option) =>
+        option
+          .setName("server")
+          .setDescription("Saved server name or ID.")
+          .setRequired(true)
+      )
+  ),
+
+  adminCommand(
+    new SlashCommandBuilder()
+      .setName("moveserver")
+      .setDescription("Move a saved server to another category.")
+      .addStringOption((option) =>
+        option
+          .setName("server")
+          .setDescription("Saved server name or ID.")
+          .setRequired(true)
+      )
+      .addStringOption((option) =>
+        option
+          .setName("category")
+          .setDescription("New category.")
+          .setRequired(true)
+      )
+  ),
+
+  adminCommand(
+    new SlashCommandBuilder()
+      .setName("serverinfo")
+      .setDescription("Show info about a saved server.")
+      .addStringOption((option) =>
+        option
+          .setName("server")
+          .setDescription("Saved server name or ID.")
+          .setRequired(true)
+      )
   ),
 
   adminCommand(
@@ -609,6 +782,168 @@ const commands = [
           .setDescription("Optional imported backup name.")
           .setRequired(false)
       )
+  ),
+
+  adminCommand(
+    new SlashCommandBuilder()
+      .setName("renamebackup")
+      .setDescription("Rename a backup.")
+      .addStringOption((option) =>
+        option
+          .setName("backup")
+          .setDescription("Backup name or ID.")
+          .setRequired(true)
+      )
+      .addStringOption((option) =>
+        option
+          .setName("name")
+          .setDescription("New backup name.")
+          .setRequired(true)
+      )
+  ),
+
+  adminCommand(
+    new SlashCommandBuilder()
+      .setName("duplicatebackup")
+      .setDescription("Duplicate a backup under a new name.")
+      .addStringOption((option) =>
+        option
+          .setName("backup")
+          .setDescription("Backup name or ID.")
+          .setRequired(true)
+      )
+      .addStringOption((option) =>
+        option
+          .setName("name")
+          .setDescription("New backup name.")
+          .setRequired(true)
+      )
+  ),
+
+  adminCommand(
+    new SlashCommandBuilder()
+      .setName("latestbackup")
+      .setDescription("Show the latest backup.")
+  ),
+
+  adminCommand(
+    new SlashCommandBuilder()
+      .setName("backupinfo")
+      .setDescription("Show what a backup contains.")
+      .addStringOption((option) =>
+        option
+          .setName("backup")
+          .setDescription("Backup name or ID.")
+          .setRequired(true)
+      )
+  ),
+
+  adminCommand(
+    new SlashCommandBuilder()
+      .setName("roleinfo")
+      .setDescription("Show information about a role.")
+      .addRoleOption((option) =>
+        option
+          .setName("role")
+          .setDescription("Role to inspect.")
+          .setRequired(true)
+      )
+  ),
+
+  adminCommand(
+    new SlashCommandBuilder()
+      .setName("channelinfo")
+      .setDescription("Show information about a channel.")
+      .addChannelOption((option) =>
+        option
+          .setName("channel")
+          .setDescription("Channel to inspect.")
+          .setRequired(true)
+      )
+  ),
+
+  adminCommand(
+    new SlashCommandBuilder()
+      .setName("clonechannel")
+      .setDescription("Clone a channel's settings and permissions.")
+      .addChannelOption((option) =>
+        option
+          .setName("channel")
+          .setDescription("Channel to clone.")
+          .setRequired(true)
+      )
+      .addStringOption((option) =>
+        option
+          .setName("name")
+          .setDescription("Name for the cloned channel.")
+          .setRequired(true)
+      )
+  ),
+
+  adminCommand(
+    new SlashCommandBuilder()
+      .setName("clonerole")
+      .setDescription("Clone a role's color, permissions, hoist, and mentionable settings.")
+      .addRoleOption((option) =>
+        option
+          .setName("role")
+          .setDescription("Role to clone.")
+          .setRequired(true)
+      )
+      .addStringOption((option) =>
+        option
+          .setName("name")
+          .setDescription("Name for the cloned role.")
+          .setRequired(true)
+      )
+  ),
+
+  adminCommand(
+    new SlashCommandBuilder()
+      .setName("antinuke")
+      .setDescription("Configure anti-nuke logging.")
+      .addBooleanOption((option) =>
+        option
+          .setName("enabled")
+          .setDescription("Turn anti-nuke logging on or off.")
+          .setRequired(true)
+      )
+      .addIntegerOption((option) =>
+        option
+          .setName("threshold")
+          .setDescription("How many actions trigger a warning.")
+          .setMinValue(2)
+          .setMaxValue(20)
+          .setRequired(false)
+      )
+      .addIntegerOption((option) =>
+        option
+          .setName("window_seconds")
+          .setDescription("Time window in seconds.")
+          .setMinValue(5)
+          .setMaxValue(300)
+          .setRequired(false)
+      )
+  ),
+
+  adminCommand(
+    new SlashCommandBuilder()
+      .setName("antinukestatus")
+      .setDescription("Show anti-nuke settings.")
+  ),
+
+  adminCommand(
+    new SlashCommandBuilder()
+      .setName("securitylog")
+      .setDescription("Show recent anti-nuke/security events.")
+      .addIntegerOption((option) =>
+        option
+          .setName("limit")
+          .setDescription("How many logs to show.")
+          .setMinValue(1)
+          .setMaxValue(20)
+          .setRequired(false)
+      )
   )
 ].map((command) => command.toJSON());
 
@@ -763,6 +1098,13 @@ function buildConfigEmbed(guild) {
         inline: true
       },
       {
+        name: "Anti-Nuke",
+        value: settings.antinuke_enabled
+          ? `On / ${settings.antinuke_threshold} actions in ${settings.antinuke_window}s`
+          : "Off",
+        inline: true
+      },
+      {
         name: "Max Saves",
         value: String(settings.max_saves),
         inline: true
@@ -776,6 +1118,45 @@ function buildConfigEmbed(guild) {
         name: "Backups",
         value: String(sql.countBackups.get(guild.id).count),
         inline: true
+      }
+    );
+}
+
+function buildHelpEmbed() {
+  return new EmbedBuilder()
+    .setColor(0x5865f2)
+    .setTitle("Bot Help")
+    .setDescription("Commands are grouped below. Admin commands require **Manage Server**.")
+    .addFields(
+      {
+        name: "General",
+        value: "`/help`, `/about`, `/ping`, `/config`",
+        inline: false
+      },
+      {
+        name: "Panel",
+        value: "`/send`, `/preview`, `/serverlist`, `/addserver`, `/removeserver`, `/clearservers`, `/refreshserver`, `/moveserver`, `/serverinfo`, `/editserver`",
+        inline: false
+      },
+      {
+        name: "Settings",
+        value: "`/setup`, `/settheme`, `/setchannel`, `/setlogchannel`, `/autopost`, `/autosave`",
+        inline: false
+      },
+      {
+        name: "Backups",
+        value: "`/save`, `/backup`, `/restorepreview`, `/deletebackup`, `/exportbackup`, `/importbackup`, `/renamebackup`, `/duplicatebackup`, `/latestbackup`, `/backupinfo`, `/backupsettings`",
+        inline: false
+      },
+      {
+        name: "Admin Tools",
+        value: "`/roleinfo`, `/channelinfo`, `/clonechannel`, `/clonerole`",
+        inline: false
+      },
+      {
+        name: "Security",
+        value: "`/antinuke`, `/antinukestatus`, `/securitylog`",
+        inline: false
       }
     );
 }
@@ -813,6 +1194,52 @@ function buildBackupSelectRows(guildId, prefix) {
   }
 
   return rows.slice(0, 5);
+}
+
+function buildBackupInfoEmbed(backup) {
+  const snap = JSON.parse(backup.data);
+  const counts = backupCounts(snap);
+
+  return new EmbedBuilder()
+    .setColor(0x5865f2)
+    .setTitle(`Backup Info: ${backup.name}`)
+    .addFields(
+      {
+        name: "Backup ID",
+        value: String(backup.id),
+        inline: true
+      },
+      {
+        name: "Created",
+        value: backup.created_at
+          ? `<t:${Math.floor(new Date(backup.created_at).getTime() / 1000)}:F>`
+          : "Unknown",
+        inline: false
+      },
+      {
+        name: "Source Server",
+        value: snap.guildName || "Unknown",
+        inline: true
+      },
+      {
+        name: "Roles",
+        value: String(counts.roles),
+        inline: true
+      },
+      {
+        name: "Categories",
+        value: String(counts.categories),
+        inline: true
+      },
+      {
+        name: "Channels",
+        value: String(counts.channels),
+        inline: true
+      }
+    )
+    .setFooter({
+      text: "Backups do not include messages, members, boosts, ownership, or integrations."
+    });
 }
 
 async function createSnapshot(guild, userId, name) {
@@ -867,7 +1294,7 @@ async function createSnapshot(guild, userId, name) {
     }));
 
   return {
-    version: 3,
+    version: 4,
     guildId: guild.id,
     guildName: guild.name,
     saveName: name,
@@ -974,17 +1401,18 @@ function buildRestorePreviewEmbed(backup, snapshot, preview) {
     });
 }
 
-function mapPermissionOverwrites(overwrites, guild, roleMap) {
+function mapPermissionOverwrites(overwrites, guild, roleMap, sourceGuildId) {
   return (overwrites || [])
     .map((overwrite) => {
-      const id =
-        overwrite.id === guild.id
-          ? guild.id
-          : roleMap.get(overwrite.id);
+      let id = null;
 
-      if (!id || (overwrite.type !== 0 && overwrite.id !== guild.id)) {
-        return null;
+      if (overwrite.id === guild.id || overwrite.id === sourceGuildId) {
+        id = guild.id;
+      } else if (overwrite.type === 0) {
+        id = roleMap.get(overwrite.id);
       }
+
+      if (!id) return null;
 
       return {
         id,
@@ -1031,6 +1459,8 @@ function channelCreateOptions(channelData, parentId, overwrites) {
 }
 
 async function restoreSnapshot(guild, snapshot) {
+  ignoreSecurityEvents(guild.id, 300000);
+
   const me = await guild.members.fetchMe();
 
   if (
@@ -1111,7 +1541,8 @@ async function restoreSnapshot(guild, snapshot) {
       const overwrites = mapPermissionOverwrites(
         channelData.overwrites,
         guild,
-        roleMap
+        roleMap,
+        snapshot.guildId
       );
 
       let category = guild.channels.cache.find(
@@ -1160,7 +1591,8 @@ async function restoreSnapshot(guild, snapshot) {
       const overwrites = mapPermissionOverwrites(
         channelData.overwrites,
         guild,
-        roleMap
+        roleMap,
+        snapshot.guildId
       );
 
       let channel = guild.channels.cache.find(
@@ -1197,6 +1629,120 @@ async function restoreSnapshot(guild, snapshot) {
   }
 
   return result;
+}
+
+function channelCloneOptions(channel, newName) {
+  const overwrites = [...channel.permissionOverwrites.cache.values()].map((overwrite) => ({
+    id: overwrite.id,
+    type: overwrite.type,
+    allow: new PermissionsBitField(overwrite.allow.bitfield),
+    deny: new PermissionsBitField(overwrite.deny.bitfield)
+  }));
+
+  const options = {
+    name: newName,
+    type: channel.type,
+    parent: channel.parentId || undefined,
+    permissionOverwrites: overwrites,
+    reason: "Channel clone"
+  };
+
+  if (
+    [
+      ChannelType.GuildText,
+      ChannelType.GuildAnnouncement,
+      ChannelType.GuildForum
+    ].includes(channel.type)
+  ) {
+    options.topic = channel.topic || undefined;
+    options.nsfw = Boolean(channel.nsfw);
+    options.rateLimitPerUser = channel.rateLimitPerUser || 0;
+  }
+
+  if (
+    [
+      ChannelType.GuildVoice,
+      ChannelType.GuildStageVoice
+    ].includes(channel.type)
+  ) {
+    options.bitrate = channel.bitrate || undefined;
+    options.userLimit = channel.userLimit ?? undefined;
+  }
+
+  return options;
+}
+
+async function handleHelp(interaction) {
+  return interaction.reply({
+    embeds: [buildHelpEmbed()],
+    ephemeral: true
+  });
+}
+
+async function handleAbout(interaction) {
+  const uptime = formatDuration(process.uptime());
+
+  const embed = new EmbedBuilder()
+    .setColor(0x5865f2)
+    .setTitle("About This Bot")
+    .addFields(
+      {
+        name: "Version",
+        value: VERSION,
+        inline: true
+      },
+      {
+        name: "Uptime",
+        value: uptime,
+        inline: true
+      },
+      {
+        name: "Servers",
+        value: String(client.guilds.cache.size),
+        inline: true
+      },
+      {
+        name: "Commands",
+        value: String(commands.length),
+        inline: true
+      },
+      {
+        name: "Saved Panel Servers",
+        value: String(sql.totalPanelServers.get().count),
+        inline: true
+      },
+      {
+        name: "Backups",
+        value: String(sql.totalBackups.get().count),
+        inline: true
+      },
+      {
+        name: "Database",
+        value: "SQLite connected",
+        inline: true
+      }
+    )
+    .setTimestamp();
+
+  return interaction.reply({
+    embeds: [embed],
+    ephemeral: true
+  });
+}
+
+async function handlePing(interaction) {
+  const sent = Date.now();
+
+  await interaction.reply({
+    content: "Pinging...",
+    ephemeral: true
+  });
+
+  const roundTrip = Date.now() - sent;
+
+  return interaction.editReply({
+    content: `Pong!\nBot latency: **${roundTrip}ms**\nAPI latency: **${Math.round(client.ws.ping)}ms**`
+  });
 }
 
 async function handleSend(interaction) {
@@ -1255,7 +1801,7 @@ async function handleSetup(interaction) {
   const embed = new EmbedBuilder()
     .setColor(getSettings(interaction.guild.id).theme)
     .setTitle("Setup Panel")
-    .setDescription("Use the buttons and menus below. Use slash commands for addserver, backups, and theme.");
+    .setDescription("Use the buttons and menus below. Use slash commands for servers, backups, theme, and anti-nuke.");
 
   const buttonRow = new ActionRowBuilder().addComponents(
     new ButtonBuilder()
@@ -1383,6 +1929,164 @@ async function handleRemoveServer(interaction) {
         .setDescription("Pick a server to remove from /send.")
     ],
     components: rows,
+    ephemeral: true
+  });
+}
+
+async function handleClearServers(interaction) {
+  const count = sql.countServers.get(interaction.guild.id).count;
+
+  sql.clearPanelServers.run(interaction.guild.id);
+
+  await logAction(
+    interaction.guild,
+    "Panel Servers Cleared",
+    `${interaction.user} cleared **${count}** saved panel server(s).`,
+    0xed4245
+  );
+
+  return interaction.reply({
+    content: `Cleared **${count}** saved server(s) from this server's panel.`,
+    ephemeral: true
+  });
+}
+
+async function handleRefreshServer(interaction) {
+  await interaction.deferReply({
+    ephemeral: true
+  });
+
+  const server = findSavedServer(
+    interaction.guild.id,
+    interaction.options.getString("server", true)
+  );
+
+  if (!server) {
+    return interaction.editReply("Saved server not found.");
+  }
+
+  if (!server.invite) {
+    return interaction.editReply("That saved server does not have an invite URL to refresh from.");
+  }
+
+  const invite = await client.fetchInvite(cleanInvite(server.invite)).catch(() => null);
+
+  if (!invite?.guild) {
+    return interaction.editReply("Could not refresh. The saved invite may be invalid or expired.");
+  }
+
+  const refreshed = {
+    host_id: interaction.guild.id,
+    server_id: invite.guild.id,
+    name: invite.guild.name || server.name,
+    description: invite.guild.description || "No server description is set.",
+    icon: getGuildIcon(invite.guild),
+    invite: `https://discord.gg/${invite.code}`,
+    category: server.category || "General",
+    added_by: interaction.user.id,
+    added_at: new Date().toISOString()
+  };
+
+  sql.upsertPanelServer.run(refreshed);
+
+  await logAction(
+    interaction.guild,
+    "Server Refreshed",
+    `${interaction.user} refreshed **${refreshed.name}**.`
+  );
+
+  return interaction.editReply({
+    embeds: [
+      new EmbedBuilder()
+        .setColor(0x57f287)
+        .setTitle("Server Refreshed")
+        .setDescription(`Refreshed **${refreshed.name}**.`)
+        .setThumbnail(refreshed.icon)
+    ]
+  });
+}
+
+async function handleMoveServer(interaction) {
+  const server = findSavedServer(
+    interaction.guild.id,
+    interaction.options.getString("server", true)
+  );
+
+  if (!server) {
+    return interaction.reply({
+      content: "Saved server not found.",
+      ephemeral: true
+    });
+  }
+
+  const category = interaction.options.getString("category", true);
+
+  sql.movePanelServer.run(category, interaction.guild.id, server.server_id);
+
+  await logAction(
+    interaction.guild,
+    "Server Moved",
+    `${interaction.user} moved **${server.name}** to **${category}**.`
+  );
+
+  return interaction.reply({
+    content: `Moved **${server.name}** to **${category}**.`,
+    ephemeral: true
+  });
+}
+
+async function handleServerInfo(interaction) {
+  const server = findSavedServer(
+    interaction.guild.id,
+    interaction.options.getString("server", true)
+  );
+
+  if (!server) {
+    return interaction.reply({
+      content: "Saved server not found.",
+      ephemeral: true
+    });
+  }
+
+  const embed = new EmbedBuilder()
+    .setColor(getSettings(interaction.guild.id).theme)
+    .setTitle(server.name)
+    .setDescription(trimText(server.description))
+    .addFields(
+      {
+        name: "Category",
+        value: server.category || "General",
+        inline: true
+      },
+      {
+        name: "Server ID",
+        value: server.server_id,
+        inline: true
+      },
+      {
+        name: "Invite",
+        value: server.invite || "No invite saved.",
+        inline: false
+      },
+      {
+        name: "Added",
+        value: server.added_at
+          ? `<t:${Math.floor(new Date(server.added_at).getTime() / 1000)}:F>`
+          : "Unknown",
+        inline: false
+      }
+    );
+
+  if (server.icon) {
+    embed.setThumbnail(server.icon);
+  }
+
+  if (server.invite) {
+    embed.setURL(server.invite);
+  }
+
+  return interaction.reply({
+    embeds: [embed],
     ephemeral: true
   });
 }
@@ -1812,6 +2516,407 @@ async function handleImportBackup(interaction) {
   });
 }
 
+async function handleRenameBackup(interaction) {
+  const backup = findBackup(
+    interaction.guild.id,
+    interaction.options.getString("backup", true)
+  );
+
+  if (!backup) {
+    return interaction.reply({
+      content: "Backup not found.",
+      ephemeral: true
+    });
+  }
+
+  const newName = interaction.options.getString("name", true).slice(0, 100);
+
+  sql.renameBackup.run(newName, interaction.guild.id, backup.id);
+
+  await logAction(
+    interaction.guild,
+    "Backup Renamed",
+    `${interaction.user} renamed backup #${backup.id} from **${backup.name}** to **${newName}**.`
+  );
+
+  return interaction.reply({
+    content: `Renamed backup #${backup.id} to **${newName}**.`,
+    ephemeral: true
+  });
+}
+
+async function handleDuplicateBackup(interaction) {
+  const backup = findBackup(
+    interaction.guild.id,
+    interaction.options.getString("backup", true)
+  );
+
+  if (!backup) {
+    return interaction.reply({
+      content: "Backup not found.",
+      ephemeral: true
+    });
+  }
+
+  const newName = interaction.options.getString("name", true).slice(0, 100);
+
+  const result = sql.addBackup.run(
+    interaction.guild.id,
+    newName,
+    interaction.user.id,
+    new Date().toISOString(),
+    backup.data
+  );
+
+  const deleted = enforceBackupLimit(interaction.guild.id);
+
+  await logAction(
+    interaction.guild,
+    "Backup Duplicated",
+    `${interaction.user} duplicated **${backup.name}** as **${newName}** (#${result.lastInsertRowid}).`
+  );
+
+  return interaction.reply({
+    content: `Duplicated **${backup.name}** as **${newName}** (#${result.lastInsertRowid}).${deleted ? ` Deleted ${deleted} old backup(s).` : ""}`,
+    ephemeral: true
+  });
+}
+
+async function handleLatestBackup(interaction) {
+  const backup = sql.listBackups.all(interaction.guild.id)[0];
+
+  if (!backup) {
+    return interaction.reply({
+      content: "No backups yet.",
+      ephemeral: true
+    });
+  }
+
+  return interaction.reply({
+    embeds: [buildBackupInfoEmbed(backup)],
+    ephemeral: true
+  });
+}
+
+async function handleBackupInfo(interaction) {
+  const backup = findBackup(
+    interaction.guild.id,
+    interaction.options.getString("backup", true)
+  );
+
+  if (!backup) {
+    return interaction.reply({
+      content: "Backup not found.",
+      ephemeral: true
+    });
+  }
+
+  return interaction.reply({
+    embeds: [buildBackupInfoEmbed(backup)],
+    ephemeral: true
+  });
+}
+
+async function handleRoleInfo(interaction) {
+  const role = interaction.options.getRole("role", true);
+  const permissions = role.permissions.toArray();
+
+  const embed = new EmbedBuilder()
+    .setColor(role.color || 0x5865f2)
+    .setTitle(`Role Info: ${role.name}`)
+    .addFields(
+      {
+        name: "Role ID",
+        value: role.id,
+        inline: true
+      },
+      {
+        name: "Position",
+        value: String(role.position),
+        inline: true
+      },
+      {
+        name: "Color",
+        value: role.hexColor,
+        inline: true
+      },
+      {
+        name: "Hoisted",
+        value: role.hoist ? "Yes" : "No",
+        inline: true
+      },
+      {
+        name: "Mentionable",
+        value: role.mentionable ? "Yes" : "No",
+        inline: true
+      },
+      {
+        name: "Managed",
+        value: role.managed ? "Yes" : "No",
+        inline: true
+      },
+      {
+        name: "Bot Can Edit",
+        value: role.editable ? "Yes" : "No",
+        inline: true
+      },
+      {
+        name: "Cached Members",
+        value: String(role.members?.size || 0),
+        inline: true
+      },
+      {
+        name: "Permissions",
+        value: permissions.length ? trimText(permissions.join(", "), 1024) : "None",
+        inline: false
+      }
+    );
+
+  return interaction.reply({
+    embeds: [embed],
+    ephemeral: true
+  });
+}
+
+async function handleChannelInfo(interaction) {
+  const channel = interaction.options.getChannel("channel", true);
+
+  const fields = [
+    {
+      name: "Channel ID",
+      value: channel.id,
+      inline: true
+    },
+    {
+      name: "Type",
+      value: channelTypeName(channel.type),
+      inline: true
+    },
+    {
+      name: "Category",
+      value: channel.parent ? channel.parent.name : "None",
+      inline: true
+    },
+    {
+      name: "Position",
+      value: String(channel.position ?? "Unknown"),
+      inline: true
+    },
+    {
+      name: "Permission Overwrites",
+      value: String(channel.permissionOverwrites?.cache?.size || 0),
+      inline: true
+    }
+  ];
+
+  if ("topic" in channel) {
+    fields.push({
+      name: "Topic",
+      value: trimText(channel.topic || "None", 1024),
+      inline: false
+    });
+  }
+
+  if ("nsfw" in channel) {
+    fields.push({
+      name: "NSFW",
+      value: channel.nsfw ? "Yes" : "No",
+      inline: true
+    });
+  }
+
+  if ("rateLimitPerUser" in channel) {
+    fields.push({
+      name: "Slowmode",
+      value: `${channel.rateLimitPerUser || 0}s`,
+      inline: true
+    });
+  }
+
+  const embed = new EmbedBuilder()
+    .setColor(getSettings(interaction.guild.id).theme)
+    .setTitle(`Channel Info: ${channel.name}`)
+    .addFields(fields);
+
+  return interaction.reply({
+    embeds: [embed],
+    ephemeral: true
+  });
+}
+
+async function handleCloneChannel(interaction) {
+  await interaction.deferReply({
+    ephemeral: true
+  });
+
+  const channel = interaction.options.getChannel("channel", true);
+  const name = interaction.options.getString("name", true).slice(0, 100);
+
+  const me = await interaction.guild.members.fetchMe();
+
+  if (!me.permissions.has(PermissionFlagsBits.ManageChannels)) {
+    return interaction.editReply("I need **Manage Channels** to clone channels.");
+  }
+
+  ignoreSecurityEvents(interaction.guild.id, 60000);
+
+  const cloned = await interaction.guild.channels.create(
+    channelCloneOptions(channel, name)
+  );
+
+  await cloned.setPosition((channel.position || 0) + 1).catch(() => {});
+
+  await logAction(
+    interaction.guild,
+    "Channel Cloned",
+    `${interaction.user} cloned ${channel} as ${cloned}.`,
+    0x57f287
+  );
+
+  return interaction.editReply(`Cloned ${channel} as ${cloned}.`);
+}
+
+async function handleCloneRole(interaction) {
+  await interaction.deferReply({
+    ephemeral: true
+  });
+
+  const role = interaction.options.getRole("role", true);
+  const name = interaction.options.getString("name", true).slice(0, 100);
+
+  if (role.id === interaction.guild.id || role.managed) {
+    return interaction.editReply("I cannot clone that role.");
+  }
+
+  const me = await interaction.guild.members.fetchMe();
+
+  if (!me.permissions.has(PermissionFlagsBits.ManageRoles)) {
+    return interaction.editReply("I need **Manage Roles** to clone roles.");
+  }
+
+  ignoreSecurityEvents(interaction.guild.id, 60000);
+
+  const cloned = await interaction.guild.roles.create({
+    name,
+    color: role.color || 0,
+    hoist: role.hoist,
+    mentionable: role.mentionable,
+    permissions: role.permissions.bitfield,
+    reason: "Role clone"
+  });
+
+  await cloned.setPosition(role.position).catch(() => {});
+
+  await logAction(
+    interaction.guild,
+    "Role Cloned",
+    `${interaction.user} cloned **${role.name}** as **${cloned.name}**.`,
+    0x57f287
+  );
+
+  return interaction.editReply(`Cloned **${role.name}** as **${cloned.name}**.`);
+}
+
+async function handleAntiNuke(interaction) {
+  const enabled = interaction.options.getBoolean("enabled", true);
+  const current = getSettings(interaction.guild.id);
+  const threshold = interaction.options.getInteger("threshold") || current.antinuke_threshold || 5;
+  const windowSeconds = interaction.options.getInteger("window_seconds") || current.antinuke_window || 20;
+
+  sql.setAntiNuke.run(
+    enabled ? 1 : 0,
+    threshold,
+    windowSeconds,
+    interaction.guild.id
+  );
+
+  await logAction(
+    interaction.guild,
+    "Anti-Nuke Updated",
+    `${interaction.user} turned anti-nuke ${enabled ? "on" : "off"} with threshold ${threshold} in ${windowSeconds}s.`
+  );
+
+  return interaction.reply({
+    content: `Anti-nuke logging is now **${enabled ? "enabled" : "disabled"}**. Threshold: **${threshold} actions in ${windowSeconds}s**.`,
+    ephemeral: true
+  });
+}
+
+async function handleAntiNukeStatus(interaction) {
+  const settings = getSettings(interaction.guild.id);
+
+  const embed = new EmbedBuilder()
+    .setColor(settings.antinuke_enabled ? 0x57f287 : 0xed4245)
+    .setTitle("Anti-Nuke Status")
+    .addFields(
+      {
+        name: "Enabled",
+        value: settings.antinuke_enabled ? "Yes" : "No",
+        inline: true
+      },
+      {
+        name: "Threshold",
+        value: String(settings.antinuke_threshold || 5),
+        inline: true
+      },
+      {
+        name: "Window",
+        value: `${settings.antinuke_window || 20}s`,
+        inline: true
+      },
+      {
+        name: "Mode",
+        value: "Logging only",
+        inline: true
+      },
+      {
+        name: "Log Channel",
+        value: settings.log_channel ? `<#${settings.log_channel}>` : "Not set",
+        inline: true
+      }
+    )
+    .setFooter({
+      text: "This detects suspicious mass role/channel/webhook activity and logs warnings."
+    });
+
+  return interaction.reply({
+    embeds: [embed],
+    ephemeral: true
+  });
+}
+
+async function handleSecurityLog(interaction) {
+  const limit = interaction.options.getInteger("limit") || 10;
+  const logs = sql.listSecurityLogs.all(interaction.guild.id, limit);
+
+  if (!logs.length) {
+    return interaction.reply({
+      content: "No security logs yet.",
+      ephemeral: true
+    });
+  }
+
+  const description = logs
+    .map((log) => {
+      const user = log.user_id && log.user_id !== "unknown" ? `<@${log.user_id}>` : "Unknown user";
+      const time = `<t:${Math.floor(new Date(log.created_at).getTime() / 1000)}:R>`;
+
+      return `**${log.event_type}** • ${time}\nUser: ${user}\n${trimText(log.detail, 200)}`;
+    })
+    .join("\n\n")
+    .slice(0, 3900);
+
+  return interaction.reply({
+    embeds: [
+      new EmbedBuilder()
+        .setColor(0xfaa61a)
+        .setTitle("Security Logs")
+        .setDescription(description)
+    ],
+    ephemeral: true
+  });
+}
+
 async function handleRemoveServerSelect(interaction) {
   const server = sql.getPanelServer.get(interaction.guild.id, interaction.values[0]);
 
@@ -2166,6 +3271,91 @@ async function runAutosaves() {
   }
 }
 
+async function getAuditExecutor(guild, auditType, targetId) {
+  try {
+    const me = await guild.members.fetchMe();
+
+    if (!me.permissions.has(PermissionFlagsBits.ViewAuditLog)) {
+      return null;
+    }
+
+    const logs = await guild.fetchAuditLogs({
+      type: auditType,
+      limit: 5
+    });
+
+    const entry = logs.entries.find((item) => {
+      const fresh = Date.now() - item.createdTimestamp < 15000;
+      const targetMatches = !targetId || item.target?.id === targetId;
+
+      return fresh && targetMatches;
+    });
+
+    return entry?.executorId || null;
+  } catch {
+    return null;
+  }
+}
+
+async function recordSecurityEvent(guild, eventType, auditType, targetId, detail) {
+  if (isIgnoringSecurity(guild.id)) return;
+
+  const settings = getSettings(guild.id);
+
+  if (!settings.antinuke_enabled) return;
+
+  const executorId = await getAuditExecutor(guild, auditType, targetId);
+  const userId = executorId || "unknown";
+
+  if (userId === client.user.id) return;
+
+  const createdAt = new Date().toISOString();
+
+  sql.addSecurityLog.run(
+    guild.id,
+    eventType,
+    userId,
+    detail,
+    createdAt
+  );
+
+  const windowMs = (settings.antinuke_window || 20) * 1000;
+  const threshold = settings.antinuke_threshold || 5;
+  const key = `${guild.id}:${userId}:${eventType}`;
+  const now = Date.now();
+
+  const bucket = securityBuckets.get(key) || {
+    timestamps: [],
+    lastAlert: 0
+  };
+
+  bucket.timestamps = bucket.timestamps.filter((timestamp) => now - timestamp < windowMs);
+  bucket.timestamps.push(now);
+
+  securityBuckets.set(key, bucket);
+
+  if (bucket.timestamps.length >= threshold && now - bucket.lastAlert > windowMs) {
+    bucket.lastAlert = now;
+
+    const userText = userId === "unknown" ? "Unknown user" : `<@${userId}>`;
+
+    await logAction(
+      guild,
+      "Possible Nuke Detected",
+      `${userText} triggered **${bucket.timestamps.length} ${eventType}** event(s) in **${settings.antinuke_window || 20}s**.\n\n${detail}\n\nUse \`/backup\` to restore from a save if needed.`,
+      0xed4245
+    );
+
+    sql.addSecurityLog.run(
+      guild.id,
+      "PossibleNuke",
+      userId,
+      `${bucket.timestamps.length} ${eventType} events in ${settings.antinuke_window || 20}s.`,
+      new Date().toISOString()
+    );
+  }
+}
+
 client.once(Events.ClientReady, () => {
   console.log(`Logged in as ${client.user.tag}`);
 
@@ -2174,6 +3364,62 @@ client.once(Events.ClientReady, () => {
 
   runAutoposts().catch(console.error);
   runAutosaves().catch(console.error);
+});
+
+client.on(Events.ChannelDelete, async (channel) => {
+  if (!channel.guild) return;
+
+  await recordSecurityEvent(
+    channel.guild,
+    "ChannelDelete",
+    AuditLogEvent.ChannelDelete,
+    channel.id,
+    `Channel deleted: **${channel.name}**`
+  );
+});
+
+client.on(Events.ChannelCreate, async (channel) => {
+  if (!channel.guild) return;
+
+  await recordSecurityEvent(
+    channel.guild,
+    "ChannelCreate",
+    AuditLogEvent.ChannelCreate,
+    channel.id,
+    `Channel created: **${channel.name}**`
+  );
+});
+
+client.on(Events.GuildRoleDelete, async (role) => {
+  await recordSecurityEvent(
+    role.guild,
+    "RoleDelete",
+    AuditLogEvent.RoleDelete,
+    role.id,
+    `Role deleted: **${role.name}**`
+  );
+});
+
+client.on(Events.GuildRoleCreate, async (role) => {
+  await recordSecurityEvent(
+    role.guild,
+    "RoleCreate",
+    AuditLogEvent.RoleCreate,
+    role.id,
+    `Role created: **${role.name}**`
+  );
+});
+
+client.on(Events.WebhooksUpdate, async (channel) => {
+  if (!channel.guild) return;
+
+  await recordSecurityEvent(
+    channel.guild,
+    "WebhookUpdate",
+    AuditLogEvent.WebhookCreate,
+    null,
+    `Webhook activity detected in **${channel.name}**.`
+  );
 });
 
 client.on(Events.InteractionCreate, async (interaction) => {
@@ -2186,7 +3432,15 @@ client.on(Events.InteractionCreate, async (interaction) => {
         });
       }
 
-      const publicCommands = ["send", "preview", "serverlist", "config"];
+      const publicCommands = [
+        "help",
+        "about",
+        "ping",
+        "send",
+        "preview",
+        "serverlist",
+        "config"
+      ];
 
       if (!hasManageServer(interaction) && !publicCommands.includes(interaction.commandName)) {
         return interaction.reply({
@@ -2196,6 +3450,15 @@ client.on(Events.InteractionCreate, async (interaction) => {
       }
 
       switch (interaction.commandName) {
+        case "help":
+          return handleHelp(interaction);
+
+        case "about":
+          return handleAbout(interaction);
+
+        case "ping":
+          return handlePing(interaction);
+
         case "send":
           return handleSend(interaction);
 
@@ -2222,6 +3485,18 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         case "removeserver":
           return handleRemoveServer(interaction);
+
+        case "clearservers":
+          return handleClearServers(interaction);
+
+        case "refreshserver":
+          return handleRefreshServer(interaction);
+
+        case "moveserver":
+          return handleMoveServer(interaction);
+
+        case "serverinfo":
+          return handleServerInfo(interaction);
 
         case "editserver":
           return handleEditServer(interaction);
@@ -2261,6 +3536,39 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         case "importbackup":
           return handleImportBackup(interaction);
+
+        case "renamebackup":
+          return handleRenameBackup(interaction);
+
+        case "duplicatebackup":
+          return handleDuplicateBackup(interaction);
+
+        case "latestbackup":
+          return handleLatestBackup(interaction);
+
+        case "backupinfo":
+          return handleBackupInfo(interaction);
+
+        case "roleinfo":
+          return handleRoleInfo(interaction);
+
+        case "channelinfo":
+          return handleChannelInfo(interaction);
+
+        case "clonechannel":
+          return handleCloneChannel(interaction);
+
+        case "clonerole":
+          return handleCloneRole(interaction);
+
+        case "antinuke":
+          return handleAntiNuke(interaction);
+
+        case "antinukestatus":
+          return handleAntiNukeStatus(interaction);
+
+        case "securitylog":
+          return handleSecurityLog(interaction);
 
         default:
           return;
